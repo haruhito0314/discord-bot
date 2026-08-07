@@ -36,22 +36,11 @@ http
 /* =========================
    環境変数
    ========================= */
-const {
-  DISCORD_TOKEN,
-  GUILD_ID,
-  CHANNEL_ID, // /poststeps を実行できるチャンネル（あなたの元コード仕様）
-  ROLE_STEP1,
-  ROLE_STEP2,
-  ROLE_STEP3,
-  ROLE_STEP4,
-  ROLE_STEP5,
-  ROLE_STEP6,
-} = process.env;
+const { DISCORD_TOKEN, GUILD_ID, BACKUP_CHANNEL_ID, BACKUP_MAX_MESSAGES_PER_CHANNEL } = process.env;
+const MAX_BACKUP_MESSAGES_PER_CHANNEL = Number(BACKUP_MAX_MESSAGES_PER_CHANNEL || 2000);
 
-const STEP_ROLE_IDS = [ROLE_STEP1, ROLE_STEP2, ROLE_STEP3, ROLE_STEP4, ROLE_STEP5, ROLE_STEP6].filter(Boolean);
-
-if (!DISCORD_TOKEN || !GUILD_ID || !CHANNEL_ID || STEP_ROLE_IDS.length !== 6) {
-  console.error("Missing env vars. Check DISCORD_TOKEN/GUILD_ID/CHANNEL_ID and ROLE_STEP1..6");
+if (!DISCORD_TOKEN || !GUILD_ID) {
+  console.error("Missing env vars. Check DISCORD_TOKEN and GUILD_ID");
   process.exit(1);
 }
 
@@ -59,7 +48,13 @@ if (!DISCORD_TOKEN || !GUILD_ID || !CHANNEL_ID || STEP_ROLE_IDS.length !== 6) {
    Client（GuildMembers intent なしでOK）
    ========================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildEmojisAndStickers,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 /* =========================
@@ -71,6 +66,7 @@ const MAX_CREATE_PER_USER = 10;
 
 const DATA_DIR = path.join(__dirname, "data");
 const STORE_FILE = path.join(DATA_DIR, "store.json");
+const BACKUPS_DIR = path.join(__dirname, "backups");
 
 function loadStore() {
   try {
@@ -116,29 +112,215 @@ function removeLockedCategory(store, guildId, categoryId) {
   store.guilds[guildId].lockedCategories = store.guilds[guildId].lockedCategories.filter((id) => id !== categoryId);
 }
 
-/* =========================
-   Stepロールのボタン行（あなたの元コード）
-   ========================= */
-function buildStepRows() {
-  const labels = ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6"];
+function ensureBackupDir() {
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+}
 
-  const buttons = STEP_ROLE_IDS.map((roleId, i) =>
-    new ButtonBuilder()
-      .setCustomId(`step_toggle:${roleId}`)
-      .setLabel(labels[i])
-      .setStyle(ButtonStyle.Primary)
-  );
+function sanitizeOverwrite(overwrite) {
+  return {
+    id: overwrite.id,
+    type: overwrite.type,
+    allow: overwrite.allow?.bitfield ?? 0,
+    deny: overwrite.deny?.bitfield ?? 0,
+  };
+}
 
-  const row1 = new ActionRowBuilder().addComponents(buttons.slice(0, 5));
-  const row2 = new ActionRowBuilder().addComponents(buttons.slice(5, 6));
+async function fetchChannelMessages(channel, maxMessages) {
+  if (!channel.isTextBased?.()) return [];
 
-  const clearBtn = new ButtonBuilder()
-    .setCustomId("step_clear")
-    .setLabel("🧹 全解除")
-    .setStyle(ButtonStyle.Secondary);
+  const collected = [];
+  let before;
 
-  row2.addComponents(clearBtn);
-  return [row1, row2];
+  while (collected.length < maxMessages) {
+    const batch = await channel.messages.fetch({ limit: Math.min(100, maxMessages - collected.length), before });
+    if (batch.size === 0) break;
+
+    const sorted = Array.from(batch.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    collected.push(...sorted);
+
+    const oldest = sorted[0];
+    before = oldest.id;
+
+    if (batch.size < 100) break;
+  }
+
+  return collected
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    .map((message) => ({
+      id: message.id,
+      content: message.content ?? "",
+      authorId: message.author?.id ?? null,
+      authorUsername: message.author?.username ?? null,
+      createdAt: message.createdAt?.toISOString() ?? null,
+      editedAt: message.editedAt?.toISOString() ?? null,
+      attachments: Array.from(message.attachments.values()).map((attachment) => ({
+        name: attachment.name ?? null,
+        url: attachment.url ?? null,
+        contentType: attachment.contentType ?? null,
+        size: attachment.size ?? null,
+      })),
+    }));
+}
+
+async function createServerBackup(guild) {
+  ensureBackupDir();
+
+  const [channelManager, roles, emojis, members] = await Promise.all([
+    guild.channels.fetch(),
+    guild.roles.fetch(),
+    guild.emojis.fetch(),
+    guild.members.fetch(),
+  ]);
+
+  const channels = Array.from(channelManager.values());
+
+  const channelData = [];
+  for (const channel of channels) {
+   const channelEntry = {
+     id: channel.id,
+     name: channel.name,
+     type: channel.type,
+     topic: channel.topic ?? null,
+     parentId: channel.parentId ?? null,
+     position: channel.position ?? null,
+     nsfw: channel.nsfw ?? false,
+     createdAt: channel.createdAt?.toISOString() ?? null,
+     permissionOverwrites: Array.from(channel.permissionOverwrites.cache.values()).map(sanitizeOverwrite),
+   };
+
+   if (channel.isTextBased?.()) {
+     channelEntry.messages = await fetchChannelMessages(channel, MAX_BACKUP_MESSAGES_PER_CHANNEL);
+   }
+
+   channelData.push(channelEntry);
+  }
+
+  const backup = {
+   generatedAt: new Date().toISOString(),
+   guild: {
+     id: guild.id,
+     name: guild.name,
+     description: guild.description ?? null,
+     iconURL: guild.iconURL({ extension: "png" }) ?? null,
+     bannerURL: guild.bannerURL({ extension: "png" }) ?? null,
+     ownerId: guild.ownerId,
+     memberCount: guild.memberCount,
+     features: guild.features ?? [],
+     verificationLevel: guild.verificationLevel,
+     explicitContentFilter: guild.explicitContentFilter,
+     defaultMessageNotifications: guild.defaultMessageNotifications,
+     systemChannelId: guild.systemChannelId ?? null,
+     afkChannelId: guild.afkChannelId ?? null,
+     afkTimeout: guild.afkTimeout,
+     preferredLocale: guild.preferredLocale,
+     premiumTier: guild.premiumTier,
+     vanityURLCode: guild.vanityURLCode ?? null,
+   },
+   channels: channelData,
+   roles: Array.from(roles.values()).map((role) => ({
+     id: role.id,
+     name: role.name,
+     color: role.color,
+     hoist: role.hoist,
+     mentionable: role.mentionable,
+     position: role.position,
+     permissions: role.permissions?.bitfield ?? 0,
+     managed: role.managed,
+     tags: role.tags ?? {},
+   })),
+   emojis: Array.from(emojis.values()).map((emoji) => ({
+     id: emoji.id,
+     name: emoji.name,
+     animated: emoji.animated,
+     available: emoji.available,
+     managed: emoji.managed,
+     roles: Array.from(emoji.roles?.cache?.values() ?? []).map((role) => role.id),
+   })),
+   members: Array.from(members.values()).map((member) => ({
+     id: member.id,
+     username: member.user?.username ?? null,
+     displayName: member.displayName,
+     bot: member.user?.bot ?? false,
+     joinedAt: member.joinedAt?.toISOString() ?? null,
+     premiumSince: member.premiumSince?.toISOString() ?? null,
+     roles: Array.from(member.roles.cache.values()).filter((role) => role.id !== guild.id).map((role) => role.id),
+   })),
+  };
+
+  const fileName = `${guild.name.replace(/[^\w.-]/g, "_")}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  const filePath = path.join(BACKUPS_DIR, fileName);
+  fs.writeFileSync(filePath, JSON.stringify(backup, null, 2), "utf8");
+
+  return { filePath, fileName, backup };
+}
+
+async function restoreBackupToGuild(backup, guild) {
+  const categoryMap = new Map();
+  const channelMap = new Map();
+  const createdChannels = [];
+
+  const categoryEntries = (backup.channels ?? []).filter((channel) => channel.type === ChannelType.GuildCategory);
+  for (const channel of categoryEntries) {
+   const created = await guild.channels.create({
+     name: channel.name,
+     type: ChannelType.GuildCategory,
+     position: channel.position ?? undefined,
+     reason: `restorebackup from ${backup.guild?.name ?? "backup"}`,
+   });
+   categoryMap.set(channel.id, created.id);
+   channelMap.set(channel.id, created.id);
+   createdChannels.push(created);
+  }
+
+  const textChannelEntries = (backup.channels ?? []).filter((channel) => channel.type === ChannelType.GuildText);
+  for (const channel of textChannelEntries) {
+   const created = await guild.channels.create({
+     name: channel.name,
+     type: ChannelType.GuildText,
+     topic: channel.topic ?? undefined,
+     parent: channel.parentId ? categoryMap.get(channel.parentId) ?? null : null,
+     nsfw: channel.nsfw ?? false,
+     position: channel.position ?? undefined,
+     reason: `restorebackup from ${backup.guild?.name ?? "backup"}`,
+   });
+   channelMap.set(channel.id, created.id);
+   createdChannels.push(created);
+  }
+
+  for (const channel of textChannelEntries) {
+   const createdChannel = guild.channels.cache.get(channelMap.get(channel.id));
+   if (!createdChannel || !Array.isArray(channel.messages)) continue;
+
+   const orderedMessages = [...channel.messages].sort((a, b) => new Date(a.createdAt ?? 0) - new Date(b.createdAt ?? 0));
+   for (const message of orderedMessages) {
+     const payload = {};
+     if (message.content?.trim()) payload.content = message.content;
+     if (message.attachments?.length) {
+       const files = [];
+       for (const attachment of message.attachments) {
+         if (!attachment.url) continue;
+         try {
+           const response = await fetch(attachment.url);
+           if (!response.ok) continue;
+           const buffer = Buffer.from(await response.arrayBuffer());
+           files.push({
+             attachment: buffer,
+             name: attachment.name || attachment.url.split("/").pop() || "attachment",
+           });
+         } catch (error) {
+           console.warn(`Failed to download attachment ${attachment.url}:`, error);
+         }
+       }
+       if (files.length) payload.files = files;
+     }
+     if (payload.content || payload.files?.length) {
+       await createdChannel.send(payload);
+       await new Promise((resolve) => setTimeout(resolve, 700));
+     }
+   }
+  }
+
+  return createdChannels;
 }
 
 /* =========================
@@ -255,13 +437,22 @@ function summarizePending(guild, data) {
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
-      .setName("poststeps")
-      .setDescription("Step1〜6のロール付与ボタンを投稿します"),
-
-    new SlashCommandBuilder()
       .setName("postpanel")
       .setDescription("チャンネル操作パネル（表）を投稿します（管理者用）")
       .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+    new SlashCommandBuilder()
+      .setName("backup")
+      .setDescription("サーバーのバックアップをJSONファイルとして保存します")
+      .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+    new SlashCommandBuilder()
+      .setName("restorebackup")
+      .setDescription("バックアップJSONを読み込んでチャンネルとメッセージ履歴を復元します")
+      .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
+      .addAttachmentOption((opt) =>
+        opt.setName("backup").setDescription("復元するバックアップJSONファイル").setRequired(true)
+      ),
 
     new SlashCommandBuilder()
       .setName("categorylock")
@@ -329,26 +520,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const botMember = interaction.guild.members.me;
       const botCanManageChannels = botMember?.permissions?.has(PermissionsBitField.Flags.ManageChannels);
-      const botCanManageRoles = botMember?.permissions?.has(PermissionsBitField.Flags.ManageRoles);
-
-      // /poststeps（あなたの元仕様：指定チャンネルのみ）
-      if (interaction.commandName === "poststeps") {
-        if (interaction.channelId !== CHANNEL_ID) {
-          return interaction.reply({ content: "このコマンドは指定チャンネルで実行してください。", ephemeral: true });
-        }
-        if (!botCanManageRoles) {
-          return interaction.reply({ content: "Botに **ロール管理(Manage Roles)** 権限が必要です。", ephemeral: true });
-        }
-
-        await interaction.channel.send({
-          content:
-            "📌 **学習ロードマップ：Stepロール**\n" +
-            "ボタンを押すと **付与/解除** できます（複数OK）。",
-          components: buildStepRows(),
-        });
-
-        return interaction.reply({ content: "投稿しました！", ephemeral: true });
-      }
 
       // /postpanel（管理者のみ）
       if (interaction.commandName === "postpanel") {
@@ -366,6 +537,72 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const store = loadStore();
         await interaction.channel.send(buildPanelMessage(store, interaction.guildId));
         return interaction.reply({ content: "✅ パネルを投稿しました（ピン留め推奨）", ephemeral: true });
+      }
+
+      if (interaction.commandName === "backup") {
+        const canRun =
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator) ||
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild);
+
+        if (!canRun) {
+          return interaction.reply({ content: "このコマンドは管理者のみ実行できます。", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const { filePath, fileName, backup } = await createServerBackup(interaction.guild);
+
+          if (BACKUP_CHANNEL_ID) {
+            const backupChannel = interaction.client.channels.cache.get(BACKUP_CHANNEL_ID) ?? (await interaction.client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null));
+            if (backupChannel?.isTextBased?.()) {
+              await backupChannel.send({
+                content: `📦 ${interaction.guild.name} のバックアップを保存しました。`,
+                files: [{ attachment: filePath, name: fileName }],
+              });
+            }
+          }
+
+          return interaction.editReply({
+            content: `📦 バックアップを保存しました。\n- 収集内容: チャンネル ${backup.channels.length}件 / ロール ${backup.roles.length}件 / 絵文字 ${backup.emojis.length}件 / メンバー ${backup.members.length}人\n- 保存先: ${filePath}`,
+          });
+        } catch (error) {
+          console.error("Backup failed:", error);
+          return interaction.editReply({ content: "バックアップの作成に失敗しました。権限やサイズを確認してください。" });
+        }
+      }
+
+      if (interaction.commandName === "restorebackup") {
+        const canRun =
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator) ||
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild);
+
+        if (!canRun) {
+          return interaction.reply({ content: "このコマンドは管理者のみ実行できます。", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const attachment = interaction.options.getAttachment("backup", true);
+          if (!attachment.name?.toLowerCase().endsWith(".json")) {
+            return interaction.editReply({ content: "バックアップJSONファイルを添付してください。" });
+          }
+
+          const response = await fetch(attachment.url);
+          if (!response.ok) {
+            return interaction.editReply({ content: "バックアップファイルを取得できませんでした。" });
+          }
+
+          const backup = await response.json();
+          const restored = await restoreBackupToGuild(backup, interaction.guild);
+          return interaction.editReply({
+            content: `✅ 復元が完了しました。\n- 作成したカテゴリ/チャンネル: ${restored.length}件\n- メッセージ履歴はテキストチャンネルごとに再送信しました。`,
+          });
+        } catch (error) {
+          console.error("Restore backup failed:", error);
+          return interaction.editReply({ content: "復元に失敗しました。ファイル形式や権限を確認してください。" });
+        }
       }
 
       // /categorylock（管理者のみ）
@@ -528,7 +765,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const botMember = interaction.guild.members.me;
       const botCanManageChannels = botMember?.permissions?.has(PermissionsBitField.Flags.ManageChannels);
-      const botCanManageRoles = botMember?.permissions?.has(PermissionsBitField.Flags.ManageRoles);
 
       // ===== パネル（表）ボタン =====
       if (interaction.customId === "panel:create_channel") {
@@ -699,51 +935,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.update({ content: `✅ 移動したよ：${channel}`, components: [] });
       }
 
-      // ===== Stepボタン（あなたの元機能） =====
-      if (!botCanManageRoles) {
-        // Stepボタンを押したのに権限がない場合の保険
-        if (interaction.customId === "step_clear" || interaction.customId.startsWith("step_toggle:")) {
-          return interaction.reply({ content: "Botに **ロール管理(Manage Roles)** 権限が必要です。", ephemeral: true });
-        }
-      }
-
-      // メンバー取得（REST fetchでOK）
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-
-      if (interaction.customId === "step_clear") {
-        const owned = STEP_ROLE_IDS.filter((id) => member.roles.cache.has(id));
-        if (owned.length === 0) {
-          return interaction.reply({ content: "今、Stepロールは付いていません。", ephemeral: true });
-        }
-        await member.roles.remove(owned);
-        return interaction.reply({ content: "🧹 Stepロールを全解除しました。", ephemeral: true });
-      }
-
-      if (interaction.customId.startsWith("step_toggle:")) {
-        const roleId = interaction.customId.split(":")[1];
-        const role = interaction.guild.roles.cache.get(roleId);
-        if (!role) {
-          return interaction.reply({ content: "ロールが見つかりませんでした。環境変数のIDを確認してね。", ephemeral: true });
-        }
-
-        const hasRole = member.roles.cache.has(roleId);
-        if (hasRole) {
-          await member.roles.remove(roleId);
-          return interaction.reply({ content: `❌ ${role.name} を外しました`, ephemeral: true });
-        } else {
-          await member.roles.add(roleId);
-          return interaction.reply({ content: `✅ ${role.name} を付けました`, ephemeral: true });
-        }
-      }
-
       return;
     }
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
       return interaction.reply({
-        content:
-          "エラー：Botの権限（Manage Channels / Manage Roles）や、ロール順（BotロールがStepロールより上）を確認して！",
+        content: "エラー：Botにチャンネル管理権限が付与されているか確認してください。",
         ephemeral: true,
       });
     }
