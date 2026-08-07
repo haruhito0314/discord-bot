@@ -48,13 +48,7 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
    Client（GuildMembers intent なしでOK）
    ========================= */
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildEmojisAndStickers,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds],
 });
 
 /* =========================
