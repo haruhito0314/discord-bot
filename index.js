@@ -93,6 +93,7 @@ function ensureGuild(store, guildId) {
     lockedCategories: [], // [categoryId, ...]
     voiceStats: { users: {} },
     voiceSessions: {},
+    voiceStatsPanelMessages: {},
   };
 }
 function getUserCount(store, guildId, userId) {
@@ -157,7 +158,7 @@ async function buildVoiceStatsMessage(store, guild) {
   const stats = getVoiceStatsEntries(store, guild.id);
   const activeSessions = getActiveVoiceUsers(store, guild.id);
 
-  const lines = stats.slice(0, 10).map((entry) => {
+  const lines = stats.slice(0, 5).map((entry) => {
     const member = guild.members.cache.get(entry.userId);
     const displayName = member?.displayName || entry.displayName || member?.user?.username || entry.username || entry.userId;
     const isActive = Boolean(activeSessions[entry.userId]);
@@ -171,7 +172,7 @@ async function buildVoiceStatsMessage(store, guild) {
       "通話中の人には「（通話中）」が付きます。"
     )
     .addFields({
-      name: "トップ10",
+      name: "トップ5",
       value: lines.length ? lines.join("\n") : "まだ記録がありません。",
     });
 
