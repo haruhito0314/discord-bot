@@ -39,6 +39,20 @@ http
 const { DISCORD_TOKEN, GUILD_ID, BACKUP_CHANNEL_ID, BACKUP_MAX_MESSAGES_PER_CHANNEL } = process.env;
 const MAX_BACKUP_MESSAGES_PER_CHANNEL = Number(BACKUP_MAX_MESSAGES_PER_CHANNEL || 2000);
 
+function formatDuration(totalSeconds) {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "0分";
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const parts = [];
+  if (hours > 0) parts.push(`${hours}時間`);
+  if (minutes > 0 || hours > 0) parts.push(`${minutes}分`);
+  if (hours === 0 && minutes < 5 && seconds > 0) parts.push(`${seconds}秒`);
+  return parts.join("");
+}
+
 if (!DISCORD_TOKEN || !GUILD_ID) {
   console.error("Missing env vars. Check DISCORD_TOKEN and GUILD_ID");
   process.exit(1);
@@ -48,7 +62,7 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
    Client（GuildMembers intent なしでOK）
    ========================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 /* =========================
@@ -77,6 +91,8 @@ function ensureGuild(store, guildId) {
   store.guilds[guildId] ??= {
     users: {},            // { [userId]: { count: number } }
     lockedCategories: [], // [categoryId, ...]
+    voiceStats: { users: {} },
+    voiceSessions: {},
   };
 }
 function getUserCount(store, guildId, userId) {
@@ -104,6 +120,66 @@ function addLockedCategory(store, guildId, categoryId) {
 function removeLockedCategory(store, guildId, categoryId) {
   ensureGuild(store, guildId);
   store.guilds[guildId].lockedCategories = store.guilds[guildId].lockedCategories.filter((id) => id !== categoryId);
+}
+
+function ensureVoiceStats(store, guildId) {
+  ensureGuild(store, guildId);
+  store.guilds[guildId].voiceStats ??= { users: {} };
+  store.guilds[guildId].voiceSessions ??= {};
+}
+
+function updateVoiceStats(store, guildId, userId, deltaSeconds, member) {
+  ensureVoiceStats(store, guildId);
+  const stats = store.guilds[guildId].voiceStats.users;
+  stats[userId] ??= { totalSeconds: 0, displayName: null, lastSeenAt: null };
+  stats[userId].totalSeconds += deltaSeconds;
+  stats[userId].lastSeenAt = Date.now();
+  if (member) {
+    stats[userId].displayName = member.displayName || member.user?.username || stats[userId].displayName || userId;
+    stats[userId].username = member.user?.username || stats[userId].username || null;
+  }
+}
+
+function getVoiceStatsEntries(store, guildId) {
+  ensureVoiceStats(store, guildId);
+  return Object.entries(store.guilds[guildId].voiceStats.users)
+    .map(([userId, data]) => ({ userId, ...data }))
+    .sort((a, b) => b.totalSeconds - a.totalSeconds);
+}
+
+function getActiveVoiceUsers(store, guildId) {
+  ensureVoiceStats(store, guildId);
+  return store.guilds[guildId].voiceSessions ?? {};
+}
+
+async function buildVoiceStatsMessage(store, guild) {
+  ensureVoiceStats(store, guild.id);
+  const stats = getVoiceStatsEntries(store, guild.id);
+  const activeSessions = getActiveVoiceUsers(store, guild.id);
+
+  const lines = stats.slice(0, 10).map((entry) => {
+    const member = guild.members.cache.get(entry.userId);
+    const displayName = member?.displayName || entry.displayName || member?.user?.username || entry.username || entry.userId;
+    const isActive = Boolean(activeSessions[entry.userId]);
+    return `- ${displayName}: ${formatDuration(entry.totalSeconds)}${isActive ? "（通話中）" : ""}`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎙️ 通話時間統計")
+    .setDescription(
+      "更新ボタンを押すと最新の統計に更新できます。\n" +
+      "通話中の人には「（通話中）」が付きます。"
+    )
+    .addFields({
+      name: "トップ10",
+      value: lines.length ? lines.join("\n") : "まだ記録がありません。",
+    });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("voice_stats:refresh").setLabel("🔄 更新").setStyle(ButtonStyle.Secondary)
+  );
+
+  return { embeds: [embed], components: [row] };
 }
 
 function ensureBackupDir() {
@@ -441,6 +517,11 @@ async function registerCommands() {
       .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
 
     new SlashCommandBuilder()
+      .setName("postvoicestats")
+      .setDescription("通話時間統計パネルを投稿します（管理者用）")
+      .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+    new SlashCommandBuilder()
       .setName("restorebackup")
       .setDescription("バックアップJSONを読み込んでチャンネルとメッセージ履歴を復元します")
       .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
@@ -564,6 +645,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
           console.error("Backup failed:", error);
           return interaction.editReply({ content: "バックアップの作成に失敗しました。権限やサイズを確認してください。" });
         }
+      }
+
+      if (interaction.commandName === "postvoicestats") {
+        const canRun =
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator) ||
+          interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild);
+
+        if (!canRun) {
+          return interaction.reply({ content: "このコマンドは管理者のみ実行できます。", ephemeral: true });
+        }
+
+        const store = loadStore();
+        const message = await buildVoiceStatsMessage(store, interaction.guild);
+        await interaction.channel.send(message);
+        return interaction.reply({ content: "✅ 通話時間統計パネルを投稿しました。", ephemeral: true });
       }
 
       if (interaction.commandName === "restorebackup") {
@@ -823,6 +919,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.update(buildPanelMessage(store, interaction.guildId));
       }
 
+      if (interaction.customId === "voice_stats:refresh") {
+        const store = loadStore();
+        const message = await buildVoiceStatsMessage(store, interaction.guild);
+        return interaction.update(message);
+      }
+
       // ===== パネル（確定/解除/キャンセル） =====
       if (interaction.customId.startsWith("panel_cancel:")) {
         const token = interaction.customId.split(":")[1];
@@ -939,6 +1041,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
     }
+  }
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  const guildId = newState.guild?.id ?? oldState.guild?.id;
+  if (!guildId) return;
+
+  const store = loadStore();
+  ensureVoiceStats(store, guildId);
+
+  const member = newState.member ?? oldState.member;
+  const userId = member?.user?.id;
+  if (!userId) return;
+
+  const sessions = store.guilds[guildId].voiceSessions;
+  const existing = sessions[userId];
+
+  if (!oldState.channelId && newState.channelId) {
+    sessions[userId] = { startedAt: Date.now(), displayName: member.displayName || member.user?.username || null };
+    saveStore(store);
+    return;
+  }
+
+  if (oldState.channelId && !newState.channelId) {
+    if (existing) {
+      const deltaSeconds = Math.floor((Date.now() - existing.startedAt) / 1000);
+      updateVoiceStats(store, guildId, userId, deltaSeconds, member);
+      delete sessions[userId];
+      saveStore(store);
+    }
+    return;
+  }
+
+  if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+    if (existing) {
+      const deltaSeconds = Math.floor((Date.now() - existing.startedAt) / 1000);
+      updateVoiceStats(store, guildId, userId, deltaSeconds, member);
+    }
+    sessions[userId] = { startedAt: Date.now(), displayName: member.displayName || member.user?.username || null };
+    saveStore(store);
   }
 });
 
