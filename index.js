@@ -153,8 +153,24 @@ function getActiveVoiceUsers(store, guildId) {
   return store.guilds[guildId].voiceSessions ?? {};
 }
 
+function syncActiveVoiceSessions(store, guildId, guild, now = Date.now()) {
+  ensureVoiceStats(store, guildId);
+  const sessions = store.guilds[guildId].voiceSessions ?? {};
+  for (const [userId, session] of Object.entries(sessions)) {
+    const member = guild?.members?.cache.get(userId) ?? null;
+    const deltaSeconds = Math.max(0, Math.floor((now - (session.startedAt || now)) / 1000));
+    if (deltaSeconds > 0) {
+      updateVoiceStats(store, guildId, userId, deltaSeconds, member);
+    }
+    session.startedAt = now;
+    session.displayName = member?.displayName || member?.user?.username || session.displayName || null;
+  }
+  return sessions;
+}
+
 async function buildVoiceStatsMessage(store, guild) {
   ensureVoiceStats(store, guild.id);
+  syncActiveVoiceSessions(store, guild.id, guild);
   const stats = getVoiceStatsEntries(store, guild.id);
   const activeSessions = getActiveVoiceUsers(store, guild.id);
 
@@ -166,13 +182,13 @@ async function buildVoiceStatsMessage(store, guild) {
   });
 
   const embed = new EmbedBuilder()
-    .setTitle("🎙️ 通話時間統計")
+  .setTitle("💼 社畜時間記録")
     .setDescription(
-      "更新ボタンを押すと最新の統計に更新できます。\n" +
-      "通話中の人には「（通話中）」が付きます。"
+    "通話に入った時間を社畜時間として記録します。\n" +
+    "更新ボタンで最新状態に更新できます。"
     )
     .addFields({
-      name: "トップ5",
+    name: "トップ5（社畜時間）",
       value: lines.length ? lines.join("\n") : "まだ記録がありません。",
     });
 
@@ -181,6 +197,42 @@ async function buildVoiceStatsMessage(store, guild) {
   );
 
   return { embeds: [embed], components: [row] };
+}
+
+async function findExistingVoiceStatsPanelMessage(channel) {
+  if (!channel?.messages?.fetch) return null;
+
+  const messages = await channel.messages.fetch({ limit: 50 });
+  return Array.from(messages.values()).find((message) => {
+    const hasVoiceButton = message.components?.some((row) =>
+      row.components?.some((component) => component.customId === "voice_stats:refresh")
+    );
+    const hasVoiceTitle = message.embeds?.some((embed) => embed.title === "🎙️ 通話時間統計");
+    return hasVoiceButton && hasVoiceTitle;
+  }) ?? null;
+}
+
+async function postOrUpdateVoiceStatsPanel(store, guild, channel) {
+  const panelPayload = await buildVoiceStatsMessage(store, guild);
+  const existing = await findExistingVoiceStatsPanelMessage(channel);
+
+  if (existing) {
+    await existing.edit(panelPayload);
+    store.guilds[guild.id].voiceStatsPanelMessages = {
+      channelId: channel.id,
+      messageId: existing.id,
+    };
+    saveStore(store);
+    return existing;
+  }
+
+  const message = await channel.send(panelPayload);
+  store.guilds[guild.id].voiceStatsPanelMessages = {
+    channelId: channel.id,
+    messageId: message.id,
+  };
+  saveStore(store);
+  return message;
 }
 
 function ensureBackupDir() {
@@ -519,7 +571,7 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName("postvoicestats")
-      .setDescription("通話時間統計パネルを投稿します（管理者用）")
+      .setDescription("社畜時間記録パネルを投稿します（管理者用）")
       .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
 
     new SlashCommandBuilder()
@@ -658,9 +710,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const store = loadStore();
-        const message = await buildVoiceStatsMessage(store, interaction.guild);
-        await interaction.channel.send(message);
-        return interaction.reply({ content: "✅ 通話時間統計パネルを投稿しました。", ephemeral: true });
+        await postOrUpdateVoiceStatsPanel(store, interaction.guild, interaction.channel);
+        return interaction.reply({ content: "✅ 通話時間統計パネルを更新しました。", ephemeral: true });
       }
 
       if (interaction.commandName === "restorebackup") {
@@ -922,8 +973,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId === "voice_stats:refresh") {
         const store = loadStore();
-        const message = await buildVoiceStatsMessage(store, interaction.guild);
-        return interaction.update(message);
+        const panelPayload = await buildVoiceStatsMessage(store, interaction.guild);
+        await interaction.update(panelPayload);
+        return;
       }
 
       // ===== パネル（確定/解除/キャンセル） =====
@@ -1058,16 +1110,17 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
   const sessions = store.guilds[guildId].voiceSessions;
   const existing = sessions[userId];
+  const now = Date.now();
 
   if (!oldState.channelId && newState.channelId) {
-    sessions[userId] = { startedAt: Date.now(), displayName: member.displayName || member.user?.username || null };
+    sessions[userId] = { startedAt: now, displayName: member.displayName || member.user?.username || null };
     saveStore(store);
     return;
   }
 
   if (oldState.channelId && !newState.channelId) {
     if (existing) {
-      const deltaSeconds = Math.floor((Date.now() - existing.startedAt) / 1000);
+      const deltaSeconds = Math.max(0, Math.floor((now - existing.startedAt) / 1000));
       updateVoiceStats(store, guildId, userId, deltaSeconds, member);
       delete sessions[userId];
       saveStore(store);
@@ -1077,10 +1130,10 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
     if (existing) {
-      const deltaSeconds = Math.floor((Date.now() - existing.startedAt) / 1000);
+      const deltaSeconds = Math.max(0, Math.floor((now - existing.startedAt) / 1000));
       updateVoiceStats(store, guildId, userId, deltaSeconds, member);
     }
-    sessions[userId] = { startedAt: Date.now(), displayName: member.displayName || member.user?.username || null };
+    sessions[userId] = { startedAt: now, displayName: member.displayName || member.user?.username || null };
     saveStore(store);
   }
 });
