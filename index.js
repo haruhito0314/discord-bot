@@ -3,6 +3,8 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createAiAssistant, buildAskCommand } = require("./ai");
+const ai = createAiAssistant();
 
 const {
   Client,
@@ -62,7 +64,8 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
    Client（GuildMembers intent なしでOK）
    ========================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates,
+    ...(ai.enabled ? [GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] : [])],
 });
 
 /* =========================
@@ -559,6 +562,7 @@ function summarizePending(guild, data) {
    ========================= */
 async function registerCommands() {
   const commands = [
+    buildAskCommand(),
     new SlashCommandBuilder()
       .setName("postpanel")
       .setDescription("チャンネル操作パネル（表）を投稿します（管理者用）")
@@ -644,6 +648,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       if (!interaction.guild) {
         return interaction.reply({ content: "サーバー内で実行してね。", ephemeral: true });
+      }
+
+      if (interaction.commandName === "ask") {
+        return await ai.handleInteraction(interaction);
       }
 
       const botMember = interaction.guild.members.me;
@@ -1095,6 +1103,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
   }
+});
+
+client.on(Events.MessageCreate, (message) => {
+  ai.handleMessage(message).catch(() => console.error("AI message handler failed"));
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
