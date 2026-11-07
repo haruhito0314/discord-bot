@@ -633,6 +633,14 @@ async function registerCommands() {
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`✅ AI models: primary=${ai.model}; simple=${ai.simpleModel ? `cerebras/${ai.simpleModel}` : "disabled"}`);
+  if (ai.enabled) {
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      console.log(`✅ AI channel access: ${JSON.stringify(await ai.auditGuildAccess(guild))}`);
+    } catch {
+      console.error("AI channel access audit failed; per-request permission checks remain active.");
+    }
+  }
   try {
     await registerCommands();
   } catch (e) {

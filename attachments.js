@@ -1,6 +1,7 @@
 const { openWordTemplate, AttachmentError, MAX_DOCX_BYTES } = require("./word-template");
 
 const MAX_TXT_BYTES = 256 * 1024;
+const MAX_PDF_BYTES = 8 * 1024 * 1024;
 const MAX_FILES = 4;
 
 function decodeText(buffer) {
@@ -21,11 +22,11 @@ function createAttachmentReader({ fetchImpl = fetch, signal } = {}) {
   const cache = new Map();
   async function read(attachment, channelId) {
     const name = attachment.name || "file";
-    const kind = /\.docx$/i.test(name) ? "docx" : /\.txt$/i.test(name) ? "txt" : null;
-    if (!kind) throw new AttachmentError("読み込める添付は.docxと.txtです。");
-    const limit = kind === "txt" ? MAX_TXT_BYTES : MAX_DOCX_BYTES;
+    const kind = /\.docx$/i.test(name) ? "docx" : /\.txt$/i.test(name) ? "txt" : /\.pdf$/i.test(name) ? "pdf" : null;
+    if (!kind) throw new AttachmentError("読み込める添付は.docx・.txt・.pdfです。");
+    const limit = kind === "txt" ? MAX_TXT_BYTES : kind === "pdf" ? MAX_PDF_BYTES : MAX_DOCX_BYTES;
     if (!Number.isFinite(attachment.size) || attachment.size < 0 || attachment.size > limit) {
-      throw new AttachmentError(kind === "txt" ? "txtは256KB以下にしてください。" : "Wordは8MB以下にしてください。");
+      throw new AttachmentError(kind === "txt" ? "txtは256KB以下にしてください。" : "Word・PDFは8MB以下にしてください。");
     }
     let url;
     try { url = new URL(attachment.url); } catch { throw new AttachmentError("添付ファイルのURLが不正です。"); }
@@ -64,8 +65,12 @@ function createAttachmentReader({ fetchImpl = fetch, signal } = {}) {
       throw new AttachmentError("添付ファイルの読み込みが中断されました。");
     }
     const buffer = Buffer.concat(chunks);
+    if (kind === "pdf" && !/%PDF-(?:1\.\d|2\.0)/.test(buffer.subarray(0, 1024).toString("latin1"))) {
+      throw new AttachmentError("PDF形式を確認できませんでした。正しい.pdfファイルを添付してください。");
+    }
     const result = kind === "txt" ? { kind, name, ...decodeText(buffer) }
-      : { kind, name, template: await openWordTemplate(buffer, { signal }) };
+      : kind === "pdf" ? { kind, name, buffer }
+        : { kind, name, template: await openWordTemplate(buffer, { signal }) };
     cache.set(cacheKey, result);
     return result;
   }

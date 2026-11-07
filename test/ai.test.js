@@ -21,14 +21,14 @@ function fixture({ responses = [final()], settings = {}, downloads = new Map() }
   const fetchedIds = [];
   const members = { [USER]: { id: USER }, [BOT]: { id: BOT } };
   const channels = new Collection();
-  const guild = { id: GUILD,
+  const guild = { id: GUILD, roles: { everyone: { id: GUILD } },
     client: { rest: { get: async (route) => {
       const [, , channelId, , userId] = route.split("/");
       if (!channels.get(channelId)?.joined) throw Error("not a thread member");
       return { user_id: userId };
     } } },
     members: { me: members[BOT], fetch: async ({ user }) => members[user], fetchMe: async () => members[BOT] },
-    channels: { cache: channels, fetch: async (id) => {
+    channels: { cache: channels, fetchActiveThreads: async () => ({ threads: new Collection() }), fetch: async (id) => {
       if (!id) return channels;
       fetchedIds.push(id);
       return channels.get(id) || null;
@@ -38,6 +38,7 @@ function fixture({ responses = [final()], settings = {}, downloads = new Map() }
     const value = { id, guildId: GUILD, name: id === SECRET ? "secret-name" : `channel-${id}`,
       type, joined, parentId: null, isThread: () => [ChannelType.PublicThread, ChannelType.PrivateThread].includes(type),
       permissionsFor: (member) => member.id === USER && !visible ? NONE : ALL,
+      permissionOverwrites: { cache: new Collection() },
       members: { fetch: async () => { if (!joined) throw Error("not a thread member"); return {}; } },
       messages: { fetch: async ({ limit, before, message: messageId }) => {
         value.readCount++;
@@ -432,4 +433,116 @@ test("HTTP and network errors never expose API response bodies or credentials", 
     assert.equal(readBody, false);
   }
   await assert.rejects(requestResponse(config(), [], { fetchImpl: async () => { throw Error("test-key"); } }), /接続できません/);
+});
+
+test("public mentions can research other public channels but never restricted history", async () => {
+  const f = fixture({ responses: [
+    { output: [call("list_channels", { after: null })] },
+    { output: [call("read_channel_history", { channel_id: OTHER, before: null })] }, final(),
+  ] });
+  f.channels.get(SECRET).permissionsFor = (member) => member.id === GUILD ? NONE : ALL;
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence 全チャンネルの決定事項は？");
+  await f.assistant.handleMessage(msg);
+  const listed = JSON.parse(f.payloads[1].input.find(i => i.type === "function_call_output").output);
+  assert.ok(listed.channels.some(c => c.id === OTHER));
+  assert.ok(!listed.channels.some(c => c.id === SECRET));
+  assert.ok(f.channels.get(OTHER).readCount > 0);
+  assert.equal(replies[0].content, "回答");
+});
+
+test("public cross-channel reads fail closed for denied overwrites and private threads", async () => {
+  for (const mode of ["overwrite", "thread", "unknown"]) {
+    const f = fixture({ responses: [{ output: [call("read_channel_history", { channel_id: OTHER, before: null })] }, final()] });
+    const other = f.channels.get(OTHER);
+    if (mode === "overwrite") other.permissionOverwrites.cache.set(USER, { deny: new PermissionsBitField(PermissionsBitField.Flags.ReadMessageHistory) });
+    if (mode === "thread") other.type = ChannelType.PrivateThread;
+    if (mode === "unknown") delete f.guild.roles;
+    await f.ask({ serverScope: true, publicReply: true });
+    assert.equal(other.readCount, 0);
+  }
+});
+
+test("server browsing includes voice text chats and uncached active forum threads", async () => {
+  const f = fixture({ responses: [{ output: [call("list_channels", { after: null })] }, final()] });
+  f.channel(OTHER, { type: ChannelType.GuildVoice });
+  const thread = f.channel("100000000000000007", { type: ChannelType.PublicThread });
+  f.channels.delete(thread.id);
+  f.guild.channels.fetchActiveThreads = async () => ({ threads: new Collection([[thread.id, thread]]) });
+  await f.ask({ serverScope: true });
+  const listed = JSON.parse(f.payloads[1].input.find(i => i.type === "function_call_output").output);
+  assert.ok(listed.channels.some(c => c.id === OTHER));
+  assert.ok(listed.channels.some(c => c.id === thread.id));
+});
+
+test("replies to this bot continue without mentions and preserve the referenced context", async () => {
+  const f = fixture({ responses: [final("続きの説明".repeat(500))] });
+  const parent = { ...message("300000000000000000", "先ほどの結論は11月10日です。"), author: { id: BOT, username: "tti-intelligence", bot: true } };
+  f.current = f.channel(CURRENT, { messages: [parent] });
+  const { msg, replies, reactions } = incomingMessage(f, "それを詳しく教えて", { reference: { messageId: parent.id, channelId: CURRENT } });
+  await f.assistant.handleMessage(msg);
+  assert.ok(JSON.stringify(f.payloads[0].input).includes("先ほどの結論は11月10日"));
+  assert.ok(replies.length > 1);
+  assert.ok(replies.every(r => r.allowedMentions.repliedUser === false));
+  assert.equal(reactions.at(-1).action, "remove");
+});
+
+test("replies to humans, other bots, webhooks and other channels do not trigger", async () => {
+  for (const mode of ["human", "otherbot", "webhook", "otherchannel"]) {
+    const f = fixture();
+    const parent = { ...message("300000000000000000", "参考"), author: { id: mode === "human" ? USER : mode === "otherbot" ? SECRET : BOT }, ...(mode === "webhook" ? { webhookId: "fake" } : {}) };
+    f.current = f.channel(CURRENT, { messages: [parent] });
+    const { msg, replies, reactions } = incomingMessage(f, "詳しく", { reference: { messageId: parent.id, channelId: mode === "otherchannel" ? OTHER : CURRENT } });
+    await f.assistant.handleMessage(msg);
+    assert.equal(f.payloads.length, 0);
+    assert.equal(replies.length, 0);
+    assert.equal(reactions.length, 0);
+  }
+});
+
+test("PDFs are supplied as native file inputs both directly and through history tools", async () => {
+  for (const direct of [true, false]) {
+    const bytes = Buffer.from("%PDF-1.7\nsynthetic fixture");
+    const attachment = attachedFile("400000000000000009", "資料.pdf", bytes);
+    const prior = message("300000000000000000", "資料", [attachment]);
+    const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, bytes]]), responses: direct ? [final()] : [
+      { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] }, final(),
+    ] });
+    f.current = f.channel(CURRENT, { messages: direct ? [] : [prior] });
+    const { msg } = incomingMessage(f, "@tti-intelligence このPDFを要約して", { attachments: direct ? [attachment] : [] });
+    await f.assistant.handleMessage(msg);
+    const payload = f.payloads.at(-1);
+    const files = payload.input.flatMap(i => Array.isArray(i.content) ? i.content : []).filter(i => i.type === "input_file");
+    assert.equal(files.length, 1);
+    assert.equal(files[0].filename, "資料.pdf");
+    assert.equal(files[0].detail, "high");
+    assert.equal(files[0].file_data, `data:application/pdf;base64,${bytes.toString("base64")}`);
+    assert.ok(!payload.input.filter(i => i.type === "function_call_output").some(i => i.output.includes("base64")));
+  }
+});
+
+test("PDF data survives reply continuation and structured Word filling", async () => {
+  const pdf = Buffer.from("%PDF-1.7\nfixture"), word = wordFixture();
+  const pdfAttachment = attachedFile("400000000000000009", "資料.pdf", pdf);
+  const wordAttachment = attachedFile("400000000000000001", "template.docx", word);
+  const original = message("300000000000000000", "元の依頼", [pdfAttachment]);
+  const parent = { ...message("300000000000000002", "資料を要約しました"), author: { id: BOT }, reference: { messageId: original.id, channelId: CURRENT } };
+  const f = fixture({ downloads: new Map([[new URL(pdfAttachment.url).pathname, pdf], [new URL(wordAttachment.url).pathname, word]]), responses: [final("調査済み"), final(JSON.stringify({ fields: { field_1: "確認済み" }, summary: "" }))] });
+  f.current = f.channel(CURRENT, { messages: [parent, original] });
+  const { msg, replies } = incomingMessage(f, "このWordの枠を埋めて", { reference: { messageId: parent.id, channelId: CURRENT }, attachments: [wordAttachment] });
+  await f.assistant.handleMessage(msg);
+  assert.ok(replies[0].files?.length);
+  assert.ok(f.payloads[1].input.some(i => Array.isArray(i.content) && i.content.some(c => c.type === "input_file")));
+});
+
+test("invalid PDFs and PDF count limits fail before contacting the model", async (t) => {
+  t.mock.method(console, "error", () => {});
+  for (const invalid of [true, false]) {
+    const bytes = Buffer.from(invalid ? "not a pdf" : "%PDF-1.7\nfixture");
+    const attachments = Array.from({ length: invalid ? 1 : 3 }, (_, i) => attachedFile(String(400000000000000001n + BigInt(i)), `file${i}.pdf`, bytes));
+    const f = fixture({ downloads: new Map(attachments.map(a => [new URL(a.url).pathname, bytes])) });
+    const { msg, replies } = incomingMessage(f, "@tti-intelligence 要約して", { attachments });
+    await f.assistant.handleMessage(msg);
+    assert.equal(f.payloads.length, 0);
+    assert.match(replies[0].content, invalid ? /PDF形式/ : /2個まで/);
+  }
 });
