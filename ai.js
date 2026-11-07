@@ -75,6 +75,16 @@ function splitReply(text, limit = 1900) {
   return chunks;
 }
 
+function mentionQuestion(content, botId) {
+  const mention = new RegExp(`<@!?${botId}>`, "g");
+  if (mention.test(content)) return content.replace(mention, "").trim();
+  // A typed name is ordinary text in Discord. Accept it only as an address
+  // at the start of the message, with a boundary after the full name.
+  const address = /^\s*@tti(?:-|[ \t]+)intelligence(?=$|[\s、，,:：!！?？。])[\s、，,:：!！?？。]*/i;
+  const match = content.match(address);
+  return match ? content.slice(match[0].length).trim() : null;
+}
+
 function publicError(error) {
   return error instanceof AiError ? error.message : "AIの処理に失敗しました。時間をおいてもう一度試してください。";
 }
@@ -253,7 +263,7 @@ function createAiAssistant({ config = loadAiConfig(), fetchImpl = fetch, now = D
     throw new AiError("未対応のツールです。");
   }
 
-  async function answer({ guild, userId, channelId, question, serverScope = false, publicReply = false, excludeMessageId }) {
+  async function answer({ guild, userId, channelId, question, serverScope = false, publicReply = false, excludeMessageId, onStart }) {
     if (guild.id !== config.guildId) throw new AiError("AI機能は設定されたサーバー内で利用してください。");
     if (typeof question !== "string" || !question.trim() || question.length > 2000) throw new AiError("質問は1〜2,000文字で送ってください。");
     const release = reserve(userId);
@@ -261,6 +271,7 @@ function createAiAssistant({ config = loadAiConfig(), fetchImpl = fetch, now = D
     const ctx = { guild, userId, signal, scopeId: serverScope ? null : channelId,
       excludeMessageId, remainingChars: MAX_CONTEXT_CHARS, readChannels: new Set() };
     try {
+      await onStart?.();
       await refreshMembers(ctx);
       const initial = await history(ctx, channelId);
       const instructions = [
@@ -337,11 +348,11 @@ function createAiAssistant({ config = loadAiConfig(), fetchImpl = fetch, now = D
 
   async function handleMessage(message) {
     if (!message.guild || message.guild.id !== config.guildId || message.author.bot || message.webhookId) return;
-    const mention = new RegExp(`<@!?${message.client.user.id}>`, "g");
-    if (!mention.test(message.content)) return;
-    const question = message.content.replace(mention, "").trim();
+    const question = mentionQuestion(message.content, message.client.user.id);
+    if (question === null) return;
     const reply = (content) => message.reply({ content, allowedMentions: NO_MENTIONS });
     let typing;
+    let thinkingReaction;
     try {
       const permissions = message.channel.permissionsFor(message.guild.members.me);
       const sendFlag = message.channel.isThread() ? PermissionsBitField.Flags.SendMessagesInThreads : PermissionsBitField.Flags.SendMessages;
@@ -350,18 +361,26 @@ function createAiAssistant({ config = loadAiConfig(), fetchImpl = fetch, now = D
         await reply("メンションに続けて質問してください。例：このチャンネルの決定事項をまとめて。ほかのチャンネルを調べる場合は /ask を使ってください。");
         return;
       }
-      await message.channel.sendTyping().catch(() => {});
-      typing = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
-      typing.unref?.();
       const text = await answer({ guild: message.guild, userId: message.author.id,
-        channelId: message.channel.id, question, publicReply: true, excludeMessageId: message.id });
+        channelId: message.channel.id, question, publicReply: true, excludeMessageId: message.id,
+        onStart: async () => {
+          thinkingReaction = await message.react("🤔").catch(() => null);
+          await message.channel.sendTyping().catch(() => {});
+          typing = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+          typing.unref?.();
+        },
+      });
       const chunks = splitReply(text);
       await reply(chunks[0]);
       for (const content of chunks.slice(1)) await message.channel.send({ content, allowedMentions: NO_MENTIONS });
     } catch (error) {
       logError(error);
       await reply(publicError(error)).catch(() => {});
-    } finally { if (typing) clearInterval(typing); }
+    } finally {
+      if (typing) clearInterval(typing);
+      // Remove only this bot's reaction, preserving other people's reactions.
+      if (thinkingReaction) await thinkingReaction.users.remove(message.client.user.id).catch(() => {});
+    }
   }
 
   return { enabled: Boolean(config.apiKey), answer, handleInteraction, handleMessage };

@@ -68,6 +68,22 @@ function message(id, content) {
   return { id, content, author: { username: "alice" }, createdTimestamp: 1794000000000, attachments: new Collection() };
 }
 
+function incomingMessage(f, content, { reactionFails = false } = {}) {
+  const replies = [];
+  const reactions = [];
+  f.current.sendTyping = async () => {};
+  const msg = { guild: f.guild, client: { user: { id: BOT } }, author: { id: USER, bot: false },
+    channel: f.current, id: "300000000000000001", content,
+    reply: async (value) => replies.push(value),
+    react: async (emoji) => {
+      if (reactionFails) throw Error("Missing AddReactions permission");
+      reactions.push({ action: "add", emoji });
+      return { users: { remove: async (id) => reactions.push({ action: "remove", userId: id }) } };
+    },
+  };
+  return { msg, replies, reactions };
+}
+
 test("Terra is the default and /ask has a required question", () => {
   assert.equal(loadAiConfig({}).model, "gpt-6.1-terra");
   const command = buildAskCommand().toJSON();
@@ -229,10 +245,7 @@ test("slash answers and all continuation chunks stay ephemeral with mentions dis
 
 test("mention reads only its own channel and ignores bots and ordinary messages", async () => {
   const f = fixture();
-  const replies = [];
-  const msg = { guild: f.guild, client: { user: { id: BOT } }, author: { id: USER, bot: false },
-    channel: f.current, id: "300000000000000001", content: "普通の会話", reply: async (value) => replies.push(value) };
-  f.current.sendTyping = async () => {};
+  const { msg, replies } = incomingMessage(f, "普通の会話");
   await f.assistant.handleMessage(msg);
   await f.assistant.handleMessage({ ...msg, content: `<@${BOT}> botの投稿`, author: { bot: true } });
   assert.equal(f.payloads.length, 0);
@@ -240,6 +253,59 @@ test("mention reads only its own channel and ignores bots and ordinary messages"
   assert.equal(f.payloads.length, 1);
   assert.equal(replies[0].content, "回答");
   assert.deepEqual(replies[0].allowedMentions, { parse: [], repliedUser: false });
+});
+
+test("typed hyphenated and legacy names work without a Discord mention token", async () => {
+  for (const content of ["@tti-intelligence 決定事項は？", "@tti intelligence 決定事項は？", " @TTI-INTELLIGENCE：決定事項は？"]) {
+    const f = fixture();
+    const { msg, replies } = incomingMessage(f, content);
+    await f.assistant.handleMessage(msg);
+    assert.equal(replies[0].content, "回答");
+    assert.equal(f.payloads[0].input[1].content, "決定事項は？");
+    assert.ok(f.fetchedIds.every((id) => id === CURRENT));
+  }
+});
+
+test("ordinary text, emails, and similarly named addresses do not trigger AI", async () => {
+  const f = fixture();
+  for (const content of ["今日は @tti-intelligence について話そう", "support@tti-intelligence.com", "@tti-intelligence-other 質問", "@tti-intelligence2 質問"]) {
+    const { msg, reactions, replies } = incomingMessage(f, content);
+    await f.assistant.handleMessage(msg);
+    assert.equal(replies.length, 0);
+    assert.equal(reactions.length, 0);
+  }
+  assert.equal(f.payloads.length, 0);
+});
+
+test("thinking reaction stays on the source while processing and removes only the bot afterward", async () => {
+  let unblock;
+  const f = fixture({ responses: [() => new Promise((resolve) => { unblock = resolve; })] });
+  const { msg, reactions, replies } = incomingMessage(f, "@tti-intelligence 要約して");
+  const pending = f.assistant.handleMessage(msg);
+  while (!unblock) await new Promise(setImmediate);
+  assert.deepEqual(reactions, [{ action: "add", emoji: "🤔" }]);
+  assert.equal(replies.length, 0);
+  unblock(final());
+  await pending;
+  assert.equal(replies[0].content, "回答");
+  assert.deepEqual(reactions, [{ action: "add", emoji: "🤔" }, { action: "remove", userId: BOT }]);
+});
+
+test("thinking reaction is removed even when generation fails", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const f = fixture({ responses: [{ status: "failed", output: [] }] });
+  const { msg, reactions, replies } = incomingMessage(f, `<@${BOT}> 要約して`);
+  await f.assistant.handleMessage(msg);
+  assert.match(replies[0].content, /正常な回答/);
+  assert.equal(reactions.at(-1).action, "remove");
+  assert.equal(reactions.at(-1).userId, BOT);
+});
+
+test("missing reaction permission does not block the answer", async () => {
+  const f = fixture();
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence 要約して", { reactionFails: true });
+  await f.assistant.handleMessage(msg);
+  assert.equal(replies[0].content, "回答");
 });
 
 test("missing credentials fail without making any request", async () => {
