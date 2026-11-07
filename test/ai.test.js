@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { ChannelType, Collection, MessageFlags, PermissionsBitField } = require("discord.js");
+const { zipSync, unzipSync, strToU8, strFromU8 } = require("fflate");
 const { createAiAssistant, loadAiConfig, requestResponse, buildAskCommand } = require("../ai");
 
 const GUILD = "100000000000000001";
@@ -15,7 +16,7 @@ const config = (extra = {}) => ({ ...loadAiConfig({ OPENAI_API_KEY: "test-key", 
 const final = (text = "回答") => ({ status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }] });
 const call = (name, args, id = "call_1") => ({ type: "function_call", name, arguments: JSON.stringify(args), call_id: id });
 
-function fixture({ responses = [final()], settings = {} } = {}) {
+function fixture({ responses = [final()], settings = {}, downloads = new Map() } = {}) {
   const payloads = [];
   const fetchedIds = [];
   const members = { [USER]: { id: USER }, [BOT]: { id: BOT } };
@@ -38,8 +39,13 @@ function fixture({ responses = [final()], settings = {} } = {}) {
       type, joined, parentId: null, isThread: () => [ChannelType.PublicThread, ChannelType.PrivateThread].includes(type),
       permissionsFor: (member) => member.id === USER && !visible ? NONE : ALL,
       members: { fetch: async () => { if (!joined) throw Error("not a thread member"); return {}; } },
-      messages: { fetch: async ({ limit, before }) => {
+      messages: { fetch: async ({ limit, before, message: messageId }) => {
         value.readCount++;
+        if (messageId) {
+          const found = messages.find((m) => m.id === messageId);
+          if (!found) throw Error("Unknown message");
+          return found;
+        }
         const page = messages.filter((m) => !before || BigInt(m.id) < BigInt(before))
           .sort((a, b) => BigInt(a.id) > BigInt(b.id) ? -1 : 1).slice(0, limit);
         return new Collection(page.map((m) => [m.id, m]));
@@ -52,7 +58,11 @@ function fixture({ responses = [final()], settings = {} } = {}) {
   channel(OTHER);
   channel(SECRET, { visible: false });
   let index = 0;
-  const fetchImpl = async (_url, options) => {
+  const fetchImpl = async (url, options) => {
+    if (url.startsWith("https://cdn.discordapp.com/")) {
+      const content = downloads.get(new URL(url).pathname);
+      return content ? new Response(content) : new Response(null, { status: 404 });
+    }
     const body = JSON.parse(options.body);
     payloads.push(body);
     const response = responses[index++];
@@ -64,16 +74,17 @@ function fixture({ responses = [final()], settings = {} } = {}) {
   return { guild, current, channel, channels, ask, assistant, payloads, fetchedIds, fetchImpl };
 }
 
-function message(id, content) {
-  return { id, content, author: { username: "alice" }, createdTimestamp: 1794000000000, attachments: new Collection() };
+function message(id, content, attachments = []) {
+  return { id, content, author: { username: "alice" }, createdTimestamp: 1794000000000, attachments: new Collection(attachments.map((a) => [a.id, a])) };
 }
 
-function incomingMessage(f, content, { reactionFails = false } = {}) {
+function incomingMessage(f, content, { reactionFails = false, attachments = [], reference } = {}) {
   const replies = [];
   const reactions = [];
   f.current.sendTyping = async () => {};
   const msg = { guild: f.guild, client: { user: { id: BOT } }, author: { id: USER, bot: false },
     channel: f.current, id: "300000000000000001", content,
+    attachments: new Collection(attachments.map((a) => [a.id, a])), reference,
     reply: async (value) => replies.push(value),
     react: async (emoji) => {
       if (reactionFails) throw Error("Missing AddReactions permission");
@@ -84,8 +95,8 @@ function incomingMessage(f, content, { reactionFails = false } = {}) {
   return { msg, replies, reactions };
 }
 
-test("Terra is the default and /ask has a required question", () => {
-  assert.equal(loadAiConfig({}).model, "gpt-6.1-terra");
+test("Sol is the default and /ask has a required question", () => {
+  assert.equal(loadAiConfig({}).model, "gpt-6.1-sol");
   const command = buildAskCommand().toJSON();
   assert.equal(command.name, "ask");
   assert.equal(command.options[0].required, true);
@@ -306,6 +317,104 @@ test("missing reaction permission does not block the answer", async () => {
   const { msg, replies } = incomingMessage(f, "@tti-intelligence 要約して", { reactionFails: true });
   await f.assistant.handleMessage(msg);
   assert.equal(replies[0].content, "回答");
+});
+
+function wordFixture() {
+  const ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  return Buffer.from(zipSync({
+    "[Content_Types].xml": strToU8('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),
+    "word/document.xml": strToU8(`<w:document xmlns:w="${ns}"><w:body><w:p><w:r><w:t>概要：{{概要}}</w:t></w:r></w:p></w:body></w:document>`),
+  }));
+}
+function attachedFile(id, name, bytes, channelId = CURRENT) {
+  return { id, name, size: bytes.length, url: `https://cdn.discordapp.com/attachments/${channelId}/${id}/${encodeURIComponent(name)}` };
+}
+
+test("a Word request replying to an earlier txt post returns a filled Word attachment", async () => {
+  const word = wordFixture();
+  const txt = Buffer.from("山田が担当し、11月10日に公開することを決定した。");
+  const wordAttachment = attachedFile("400000000000000001", "テンプレート.docx", word);
+  const txtAttachment = attachedFile("400000000000000002", "議事録.txt", txt);
+  const txtMessage = message("300000000000000000", "事前に置いた参考資料", [txtAttachment]);
+  const downloads = new Map([[new URL(wordAttachment.url).pathname, word], [new URL(txtAttachment.url).pathname, txt]]);
+  const f = fixture({ downloads, responses: [final("山田が11月10日に公開します。"), final(JSON.stringify({ fields: { field_1: "山田が担当。11月10日に公開。" }, summary: "会話とtxtの内容を反映しました。" }))] });
+  f.current = f.channel(CURRENT, { messages: [txtMessage] });
+  const { msg, replies, reactions } = incomingMessage(f, "@tti-intelligence この枠をチャットの内容で埋めて", {
+    attachments: [wordAttachment], reference: { messageId: txtMessage.id, channelId: CURRENT },
+  });
+  await f.assistant.handleMessage(msg);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /入力欄を埋めました/);
+  assert.equal(replies[0].files[0].name, "テンプレート_記入済み.docx");
+  assert.match(strFromU8(unzipSync(replies[0].files[0].attachment)["word/document.xml"]), /山田が担当。11月10日に公開。/);
+  assert.ok(JSON.stringify(f.payloads[0].input).includes("山田が担当し"));
+  assert.equal(f.payloads[1].text.format.type, "json_schema");
+  assert.equal(reactions.at(-1).action, "remove");
+});
+
+test("the model can read a txt file found in recent history without a reply", async () => {
+  const txt = Buffer.from("リリース日は11月10日です。");
+  const attachment = attachedFile("400000000000000002", "先週の議事録.txt", txt);
+  const prior = message("300000000000000000", "ここに資料を置きます", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, txt]]), responses: [
+    { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] }, final("11月10日です。"),
+  ] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  assert.equal(await f.ask({ question: "先に置いたtxtを読んでリリース日を教えて" }), "11月10日です。");
+  const toolResult = f.payloads[1].input.find((item) => item.type === "function_call_output");
+  assert.ok(toolResult.output.includes("リリース日は11月10日"));
+});
+
+test("attachment reads cannot bypass the public channel boundary", async () => {
+  const f = fixture({ responses: [
+    { output: [call("read_message_attachments", { channel_id: SECRET, message_id: "300000000000000000" })] }, final(),
+  ] });
+  await f.ask();
+  assert.ok(!f.fetchedIds.includes(SECRET));
+  assert.match(f.payloads[1].input.find((item) => item.type === "function_call_output").output, /指定チャンネルだけ/);
+});
+
+test("a Cerebras outage falls back to Sol and still produces an answer", async () => {
+  const f = fixture({ responses: [final("Solからの回答")] });
+  let cerebrasCalls = 0;
+  const assistant = createAiAssistant({ config: config({ cerebrasApiKey: "test-cerebras", cerebrasModel: "qwen-3.8-27b" }),
+    fetchImpl: async (url, options) => {
+      if (url.includes("api.cerebras.ai")) { cerebrasCalls++; return new Response(null, { status: 429 }); }
+      return f.fetchImpl(url, options);
+    },
+  });
+  assert.equal(await assistant.answer({ guild: f.guild, userId: USER, channelId: CURRENT, question: "こんにちは" }), "Solからの回答");
+  assert.equal(cerebrasCalls, 1);
+  assert.equal(f.payloads[0].model, "gpt-6.1-sol");
+});
+
+test("a short greeting replying to a txt post stays on Sol and reads the attachment", async () => {
+  const txt = Buffer.from("参照する資料です。");
+  const attachment = attachedFile("400000000000000002", "notes.txt", txt);
+  const prior = message("300000000000000000", "資料", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, txt]]), responses: [final("資料を確認しました")] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  const { msg } = incomingMessage(f, "@tti-intelligence こんにちは", { reference: { messageId: prior.id, channelId: CURRENT } });
+  const assistant = createAiAssistant({ config: config({ cerebrasApiKey: "test-cerebras" }), fetchImpl: (url, options) => {
+    assert.ok(!url.includes("api.cerebras.ai"));
+    return f.fetchImpl(url, options);
+  } });
+  assert.equal(await assistant.answer({ guild: f.guild, userId: USER, channelId: CURRENT, question: "こんにちは", sourceMessage: msg }), "資料を確認しました");
+  assert.ok(JSON.stringify(f.payloads[0].input).includes("参照する資料です"));
+});
+
+test("Word generation refuses incomplete JSON output rather than returning an unfilled file", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const bytes = wordFixture();
+  const attachment = attachedFile("400000000000000001", "template.docx", bytes);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, bytes]]), responses: [
+    final("調査済み"), { ...final('{"fields":'), status: "incomplete" },
+  ] });
+  const { msg, replies, reactions } = incomingMessage(f, "@tti-intelligence この枠を埋めて", { attachments: [attachment] });
+  await f.assistant.handleMessage(msg);
+  assert.match(replies[0].content, /出力上限/);
+  assert.equal(replies[0].files, undefined);
+  assert.equal(reactions.at(-1).action, "remove");
 });
 
 test("missing credentials fail without making any request", async () => {

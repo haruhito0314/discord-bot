@@ -6,14 +6,18 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test",
-    "check": "node --check index.js && node --check ai.js",
-    "test:openai": "node scripts/check-openai.js"
+    "check": "node --check index.js && node --check ai.js && node --check attachments.js && node --check word-template.js && node --check simple-requests.js",
+    "test:openai": "node scripts/check-openai.js",
+    "test:cerebras": "node scripts/check-cerebras.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
     "discord.js": "^14.25.1",
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "fflate": "^0.8.3",
+    "yauzl": "^3.4.0"
   }
 }

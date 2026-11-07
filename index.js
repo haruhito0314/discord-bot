@@ -632,6 +632,7 @@ async function registerCommands() {
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`✅ AI models: primary=${ai.model}; simple=${ai.simpleModel ? `cerebras/${ai.simpleModel}` : "disabled"}`);
   try {
     await registerCommands();
   } catch (e) {
