@@ -27,7 +27,7 @@ function compareIds(a, b) {
 function loadAiConfig(env = process.env) {
   return {
     apiKey: env.OPENAI_API_KEY?.trim(),
-    model: env.OPENAI_MODEL?.trim() || "gpt-6.1-sol",
+    model: env.OPENAI_MODEL?.trim() || "gpt-6.1-terra",
     cerebrasApiKey: env.CEREBRAS_API_KEY?.trim(),
     cerebrasModel: env.CEREBRAS_MODEL?.trim() || "qwen-3.8-27b",
     guildId: env.GUILD_ID,

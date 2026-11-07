@@ -101,8 +101,8 @@ function incomingMessage(f, content, { reactionFails = false, attachments = [], 
   return { msg, replies, reactions };
 }
 
-test("Sol is the default and /ask has a required question", () => {
-  assert.equal(loadAiConfig({}).model, "gpt-6.1-sol");
+test("Terra is the default and /ask has a required question", () => {
+  assert.equal(loadAiConfig({}).model, "gpt-6.1-terra");
   const command = buildAskCommand().toJSON();
   assert.equal(command.name, "ask");
   assert.equal(command.options[0].required, true);
@@ -528,8 +528,8 @@ test("attachment reads cannot bypass the public channel boundary", async () => {
   assert.match(f.payloads[1].input.find((item) => item.type === "function_call_output").output, /指定チャンネルだけ/);
 });
 
-test("a Cerebras outage falls back to Sol and still produces an answer", async () => {
-  const f = fixture({ responses: [final("Solからの回答")] });
+test("a Cerebras outage falls back to Terra and still produces an answer", async () => {
+  const f = fixture({ responses: [final("Terraからの回答")] });
   let cerebrasCalls = 0;
   const assistant = createAiAssistant({ config: config({ cerebrasApiKey: "test-cerebras", cerebrasModel: "qwen-3.8-27b" }),
     fetchImpl: async (url, options) => {
@@ -537,12 +537,12 @@ test("a Cerebras outage falls back to Sol and still produces an answer", async (
       return f.fetchImpl(url, options);
     },
   });
-  assert.equal(await assistant.answer({ guild: f.guild, userId: USER, channelId: CURRENT, question: "こんにちは" }), "Solからの回答");
+  assert.equal(await assistant.answer({ guild: f.guild, userId: USER, channelId: CURRENT, question: "こんにちは" }), "Terraからの回答");
   assert.equal(cerebrasCalls, 1);
-  assert.equal(f.payloads[0].model, "gpt-6.1-sol");
+  assert.equal(f.payloads[0].model, "gpt-6.1-terra");
 });
 
-test("a short greeting replying to a txt post stays on Sol and reads the attachment", async () => {
+test("a short greeting replying to a txt post stays on Terra and reads the attachment", async () => {
   const txt = Buffer.from("参照する資料です。");
   const attachment = attachedFile("400000000000000002", "notes.txt", txt);
   const prior = message("300000000000000000", "資料", [attachment]);
