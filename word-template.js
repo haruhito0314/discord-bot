@@ -200,6 +200,8 @@ async function openWordTemplate(buffer, { signal } = {}) {
       if (!props || !content || ["lock", "dataBinding", "checkbox", "date", "dropDownList", "comboBox", "picture", "repeatingSection"].some((name) =>
         Array.from(props.getElementsByTagName("*")).some((n) => n.localName === name))
         || descendants(content, "tbl").length || descendants(content, "drawing").length) continue;
+      // Populated controls are existing document text, not blank input fields.
+      if (visibleText(content).trim() && !children(props, "showingPlcHdr").length) continue;
       const label = (children(props, "alias")[0] || children(props, "tag")[0])?.getAttributeNS(W, "val") || visibleText(content) || "テキスト入力欄";
       add(part, content, "control", label, { control });
       claimed.push(control);

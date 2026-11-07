@@ -16,8 +16,9 @@ const config = (extra = {}) => ({ ...loadAiConfig({ OPENAI_API_KEY: "test-key", 
 const final = (text = "回答") => ({ status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }] });
 const call = (name, args, id = "call_1") => ({ type: "function_call", name, arguments: JSON.stringify(args), call_id: id });
 
-function fixture({ responses = [final()], settings = {}, downloads = new Map() } = {}) {
+function fixture({ responses = [final()], settings = {}, downloads = new Map(), inputTokens = 100000 } = {}) {
   const payloads = [];
+  const countPayloads = [];
   const fetchedIds = [];
   const members = { [USER]: { id: USER }, [BOT]: { id: BOT } };
   const channels = new Collection();
@@ -65,6 +66,10 @@ function fixture({ responses = [final()], settings = {}, downloads = new Map() }
       return content ? new Response(content) : new Response(null, { status: 404 });
     }
     const body = JSON.parse(options.body);
+    if (url.endsWith("/input_tokens")) {
+      countPayloads.push(body);
+      return { ok: true, json: async () => ({ input_tokens: inputTokens }) };
+    }
     payloads.push(body);
     const response = responses[index++];
     if (!response) throw Error("unexpected API call");
@@ -72,7 +77,7 @@ function fixture({ responses = [final()], settings = {}, downloads = new Map() }
   };
   const assistant = createAiAssistant({ config: config(settings), fetchImpl });
   const ask = (extra = {}) => assistant.answer({ guild, userId: USER, channelId: CURRENT, question: "決定事項は？", ...extra });
-  return { guild, current, channel, channels, ask, assistant, payloads, fetchedIds, fetchImpl };
+  return { guild, current, channel, channels, ask, assistant, payloads, countPayloads, fetchedIds, fetchImpl };
 }
 
 function message(id, content, attachments = []) {
@@ -353,6 +358,81 @@ test("a Word request replying to an earlier txt post returns a filled Word attac
   assert.equal(reactions.at(-1).action, "remove");
 });
 
+test("short follow-up requests still return the Word attached to the referenced request", async () => {
+  for (const question of ["これできますか", "これやって", "お願いします", "Wordで返して", "ワードファイルを送って", "空欄に書いてください"]) {
+    const word = wordFixture();
+    const attachment = attachedFile("400000000000000001", "template.docx", word);
+    const prior = message("300000000000000000", "この枠をチャットで埋めて", [attachment]);
+    const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, word]]), responses: [final("調査済み"), final(JSON.stringify({ fields: { field_1: "完成した文章" }, summary: "" }))] });
+    f.current = f.channel(CURRENT, { messages: [prior] });
+    const { msg, replies } = incomingMessage(f, `@tti-intelligence ${question}`, { reference: { messageId: prior.id, channelId: CURRENT } });
+    await f.assistant.handleMessage(msg);
+    assert.ok(replies[0].files?.length, question);
+    assert.match(strFromU8(unzipSync(replies[0].files[0].attachment)["word/document.xml"]), /完成した文章/);
+  }
+});
+
+test("a Word found with the attachment tool is filled and returned as a file", async () => {
+  const word = wordFixture();
+  const attachment = attachedFile("400000000000000001", "template.docx", word);
+  const prior = message("300000000000000000", "入力用の資料です", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, word]]), responses: [
+    { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] },
+    final("調査済み"), final(JSON.stringify({ fields: { field_1: "既存文章は保って記入" }, summary: "" })),
+  ] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence 先ほどのWordの空欄を埋めて返して");
+  await f.assistant.handleMessage(msg);
+  assert.ok(replies[0].files?.length);
+  const output = JSON.parse(f.payloads[1].input.find(i => i.type === "function_call_output").output);
+  assert.equal(output.word_output_selected, true);
+});
+
+test("Word returned through /ask remains an ephemeral file response", async () => {
+  const word = wordFixture();
+  const attachment = attachedFile("400000000000000001", "template.docx", word);
+  const prior = message("300000000000000000", "入力用", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, word]]), responses: [
+    { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] }, final("調査済み"),
+    final(JSON.stringify({ fields: { field_1: "非公開回答" }, summary: "" })),
+  ] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  let deferred, delivered;
+  await f.assistant.handleInteraction({ guild: f.guild, user: { id: USER }, channel: f.current,
+    options: { getChannel: () => null, getString: () => "先ほどのWordで返して" },
+    deferReply: async value => { deferred = value; }, editReply: async value => { delivered = value; },
+  });
+  assert.equal(deferred.flags, MessageFlags.Ephemeral);
+  assert.ok(delivered.files?.length);
+  assert.equal(delivered.allowedMentions.repliedUser, false);
+});
+
+test("reading a Word does not fill it unless an output task was requested", async () => {
+  const word = wordFixture();
+  const attachment = attachedFile("400000000000000001", "template.docx", word);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, word]]) });
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence このWordには何が書いてある？", { attachments: [attachment] });
+  await f.assistant.handleMessage(msg);
+  assert.equal(replies[0].files, undefined);
+  assert.equal(f.payloads.length, 1);
+});
+
+test("Word discovered in history cannot bypass missing destination attachment permission", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const word = wordFixture();
+  const attachment = attachedFile("400000000000000001", "template.docx", word);
+  const prior = message("300000000000000000", "入力用", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, word]]), responses: [
+    { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] }, final("ファイルを添付する権限が必要です"),
+  ] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  f.current.permissionsFor = () => new PermissionsBitField(PermissionsBitField.All & ~PermissionsBitField.Flags.AttachFiles & ~PermissionsBitField.Flags.Administrator);
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence Wordで返して");
+  await f.assistant.handleMessage(msg);
+  assert.equal(replies[0].files, undefined);
+  assert.match(f.payloads[1].input.find(i => i.type === "function_call_output").output, /ファイルを添付/);
+});
+
 test("the model can read a txt file found in recent history without a reply", async () => {
   const txt = Buffer.from("リリース日は11月10日です。");
   const attachment = attachedFile("400000000000000002", "先週の議事録.txt", txt);
@@ -363,7 +443,80 @@ test("the model can read a txt file found in recent history without a reply", as
   f.current = f.channel(CURRENT, { messages: [prior] });
   assert.equal(await f.ask({ question: "先に置いたtxtを読んでリリース日を教えて" }), "11月10日です。");
   const toolResult = f.payloads[1].input.find((item) => item.type === "function_call_output");
-  assert.ok(toolResult.output.includes("リリース日は11月10日"));
+  assert.ok(JSON.parse(toolResult.output).files[0].full_text_supplied);
+  assert.ok(f.payloads[1].input.some(i => typeof i.content === "string" && i.content.includes("リリース日は11月10日")));
+});
+
+test("large txt is sent whole in one generation request including the final bytes", async () => {
+  const text = "START-MARKER\n" + "ordinary row\n".repeat(30000) + "TAIL-MARKER-742";
+  const txt = Buffer.from(text);
+  assert.ok(txt.length > 256 * 1024);
+  const attachment = attachedFile("400000000000000002", "large.txt", txt);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, txt]]) });
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence このtxtの末尾のコードは？", { attachments: [attachment] });
+  await f.assistant.handleMessage(msg);
+  assert.equal(f.payloads.length, 1);
+  assert.equal(f.countPayloads.length, 1);
+  const full = f.payloads[0].input.find(i => i.content?.includes?.("---本文ここから---"));
+  assert.ok(full.content.includes(text));
+  assert.deepEqual(f.countPayloads[0].input, f.payloads[0].input);
+  assert.equal(replies[0].content, "回答");
+});
+
+test("oversized token counts stop before generation instead of silently cutting the txt", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const txt = Buffer.from("large input\n".repeat(30000));
+  const attachment = attachedFile("400000000000000002", "large.txt", txt);
+  const f = fixture({ inputTokens: 900001, downloads: new Map([[new URL(attachment.url).pathname, txt]]) });
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence txt全文を読んで", { attachments: [attachment] });
+  await f.assistant.handleMessage(msg);
+  assert.equal(f.payloads.length, 0);
+  assert.equal(f.countPayloads.length, 1);
+  assert.match(replies[0].content, /90万トークン/);
+});
+
+test("large txt discovered through a tool is also supplied whole in the next request", async () => {
+  const text = "earlier notes\n".repeat(24000) + "END-OF-HISTORY-TXT";
+  const txt = Buffer.from(text);
+  const attachment = attachedFile("400000000000000002", "old-large.txt", txt);
+  const prior = message("300000000000000000", "資料", [attachment]);
+  const f = fixture({ downloads: new Map([[new URL(attachment.url).pathname, txt]]), responses: [
+    { output: [call("read_message_attachments", { channel_id: CURRENT, message_id: prior.id })] }, final(),
+  ] });
+  f.current = f.channel(CURRENT, { messages: [prior] });
+  await f.ask({ question: "前のtxtを全文読んで" });
+  assert.equal(f.payloads.length, 2);
+  assert.equal(f.countPayloads.length, 1);
+  assert.ok(f.payloads[1].input.some(i => i.content?.includes?.(text)));
+});
+
+test("Word filling receives the entire large txt in both research and structured generation", async () => {
+  const text = "memo\n".repeat(20000) + "末尾にある重要な決定事項";
+  const txt = Buffer.from(text), word = wordFixture();
+  const a = attachedFile("400000000000000002", "large.txt", txt);
+  const b = attachedFile("400000000000000001", "template.docx", word);
+  const f = fixture({ downloads: new Map([[new URL(a.url).pathname, txt], [new URL(b.url).pathname, word]]), responses: [
+    final("調査済み"), final(JSON.stringify({ fields: { field_1: "末尾の決定事項を反映" }, summary: "" })),
+  ] });
+  const { msg, replies } = incomingMessage(f, "@tti-intelligence このWordをtxtで埋めて", { attachments: [a, b] });
+  await f.assistant.handleMessage(msg);
+  assert.equal(f.countPayloads.length, 2);
+  assert.ok(f.payloads.every(body => body.input.some(i => i.content?.includes?.(text))));
+  assert.ok(replies[0].files?.length);
+});
+
+test("token counting failures do not expose response bodies or fall through to generation", async () => {
+  for (const status of [401, 429, 500]) {
+    let calls = 0;
+    await assert.rejects(requestResponse(config(), [{ role: "user", content: "large" }], {
+      countFullTextTokens: true, fetchImpl: async url => {
+        calls++;
+        assert.ok(url.endsWith("input_tokens"));
+        return { ok: false, status, json: async () => { throw Error("must not read provider error body"); } };
+      },
+    }), /入力サイズ確認/);
+    assert.equal(calls, 1);
+  }
 });
 
 test("attachment reads cannot bypass the public channel boundary", async () => {

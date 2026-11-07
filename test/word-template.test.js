@@ -58,6 +58,16 @@ test("preserves existing cells, decorative empty paragraphs, and unsupported con
   assert.match(template.text, /既存の回答/);
 });
 
+test("populated text controls and existing document text remain unchanged while empty cells are filled", async () => {
+  const populated = '<w:sdt><w:sdtPr><w:alias w:val="氏名"/><w:text/></w:sdtPr><w:sdtContent>' + p("既に記入された氏名") + '</w:sdtContent></w:sdt>';
+  const template = await openWordTemplate(docx(p("変更しない説明文") + populated + `<w:tbl><w:tr>${cell("レポート本文")}${cell()}</w:tr></w:tbl>`));
+  assert.equal(template.fields.length, 1);
+  const output = xml(template.fill({ field_1: "空欄にだけ追加する本文" }));
+  assert.match(output, /変更しない説明文/);
+  assert.match(output, /既に記入された氏名/);
+  assert.match(output, /空欄にだけ追加する本文/);
+});
+
 test("rejects incomplete and oversized model edits before changing the document", async () => {
   const template = await openWordTemplate(docx(p("{{概要}}")));
   assert.throws(() => template.fill({ wrong_field: "改ざん" }), /不完全/);
@@ -112,7 +122,7 @@ test("only downloads genuine Discord attachment URLs for the source channel", as
 });
 
 test("enforces actual download size even when attachment metadata lies", async () => {
-  const reader = createAttachmentReader({ fetchImpl: async () => new Response(new Uint8Array(256 * 1024 + 1)) });
+  const reader = createAttachmentReader({ fetchImpl: async () => new Response(new Uint8Array(8 * 1024 * 1024 + 1)) });
   await assert.rejects(reader.read({ name: "notes.txt", size: 1, url: `https://cdn.discordapp.com/attachments/${CHANNEL}/${FILE}/notes.txt` }, CHANNEL), /サイズ上限/);
 });
 

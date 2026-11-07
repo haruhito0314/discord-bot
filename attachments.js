@@ -1,6 +1,6 @@
 const { openWordTemplate, AttachmentError, MAX_DOCX_BYTES } = require("./word-template");
 
-const MAX_TXT_BYTES = 256 * 1024;
+const MAX_TXT_BYTES = 8 * 1024 * 1024;
 const MAX_PDF_BYTES = 8 * 1024 * 1024;
 const MAX_FILES = 4;
 
@@ -26,7 +26,7 @@ function createAttachmentReader({ fetchImpl = fetch, signal } = {}) {
     if (!kind) throw new AttachmentError("読み込める添付は.docx・.txt・.pdfです。");
     const limit = kind === "txt" ? MAX_TXT_BYTES : kind === "pdf" ? MAX_PDF_BYTES : MAX_DOCX_BYTES;
     if (!Number.isFinite(attachment.size) || attachment.size < 0 || attachment.size > limit) {
-      throw new AttachmentError(kind === "txt" ? "txtは256KB以下にしてください。" : "Word・PDFは8MB以下にしてください。");
+      throw new AttachmentError("Word・txt・PDFは1個8MB以下にしてください。");
     }
     let url;
     try { url = new URL(attachment.url); } catch { throw new AttachmentError("添付ファイルのURLが不正です。"); }
